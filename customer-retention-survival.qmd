@@ -1,0 +1,225 @@
+---
+title: "Customer Retention: Survival Analysis of Churn"
+author: "Hisyam Maheswara Kusuma Saputro"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+execute:
+  warning: false
+  message: false
+---
+
+## Introduction
+
+<!--
+- 2-3 sentences: why survival analysis instead of plain classification for churn.
+- Key idea: churn is time-to-event, not just yes/no. Classification throws away
+  *when* a customer churns; survival analysis keeps it.
+- State the business question, e.g.:
+  "How long do customers stay before churning, and which factors accelerate
+  or delay churn?"
+-->
+
+## Data
+
+<!--
+- Dataset: Telco Customer Churn (Kaggle) or your own.
+- Required columns: tenure (duration), Churn (event indicator), covariates.
+- Note censoring: customers still active at data collection = censored, not "no event".
+-->
+
+```{r}
+library(tidyverse)
+library(survival)
+library(survminer)
+library(randomForestSRC)
+
+df <- read_csv("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")  # update path
+glimpse(df)
+```
+
+```{r}
+# Basic cleaning
+# - TotalCharges is stored as character with 11 blank (" ") entries, all at
+#   tenure = 0 (brand-new customers, never billed). These have no observed
+#   survival time, so they're dropped rather than imputed.
+# - Churn recoded to 0/1 event indicator.
+# - customerID kept for reference but excluded from modeling formulas.
+# - SeniorCitizen cast to factor (stored as 0/1 int, but categorical).
+
+df <- df %>%
+  filter(tenure > 0) %>%
+  mutate(
+    Churn = ifelse(Churn == "Yes", 1, 0),
+    TotalCharges = as.numeric(TotalCharges),
+    SeniorCitizen = factor(SeniorCitizen, labels = c("No", "Yes"))
+  )
+
+summary(df)
+```
+
+### Censoring check
+
+<!-- Show proportion censored vs event observed -- standard in a survival
+     write-up, reviewers will look for it. -->
+
+```{r}
+event_rate <- mean(df$Churn)
+cat(sprintf("Event (churn) rate: %.2f%%\n", event_rate * 100))
+cat(sprintf("Censored rate: %.2f%%\n", (1 - event_rate) * 100))
+```
+
+## Exploratory Analysis
+
+```{r}
+ggplot(df, aes(x = tenure, fill = factor(Churn))) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 30) +
+  labs(x = "Tenure (months)", y = "Count", fill = "Churned") +
+  theme_minimal()
+```
+
+## Kaplan-Meier Estimation
+
+<!--
+- Overall survival curve.
+- Segmented KM curves by a key categorical variable (e.g. Contract type).
+- Log-rank test to confirm segments differ significantly.
+-->
+
+```{r}
+km_fit <- survfit(Surv(tenure, Churn) ~ 1, data = df)
+
+ggsurvplot(
+  km_fit,
+  data = df,
+  title = "Overall Survival Curve",
+  xlab = "Tenure (months)",
+  ylab = "Survival Probability"
+)
+```
+
+```{r}
+# Segmented by a key variable -- update column name if needed
+km_fit_group <- survfit(Surv(tenure, Churn) ~ Contract, data = df)
+
+ggsurvplot(
+  km_fit_group,
+  data = df,
+  pval = TRUE,
+  risk.table = TRUE,
+  title = "Survival Curves by Contract Type"
+)
+```
+
+<!-- Interpretation: state p-value, whether survival differs significantly
+     between groups, and what that means for the business. -->
+
+## Cox Proportional Hazards Model
+
+```{r}
+# customerID excluded -- identifier, not a predictor
+df_model <- df %>% select(-customerID)
+
+cox_fit <- coxph(Surv(tenure, Churn) ~ ., data = df_model)
+summary(cox_fit)
+```
+
+<!-- Interpretation: pick 2-3 covariates with notable hazard ratios and explain
+     in plain language, e.g. "Month-to-month contract customers have a hazard
+     ratio of X relative to two-year contracts -- Xx more likely to churn at
+     any given time." -->
+
+### Proportional Hazards Assumption Check
+
+<!--
+This is the step most portfolio projects skip. Including it signals rigor.
+-->
+
+```{r}
+ph_test <- cox.zph(cox_fit)
+ph_test
+ggcoxzph(ph_test)
+```
+
+<!-- If the assumption is violated for a variable, note it -- e.g. stratify by
+     that variable instead of including it as a linear covariate. Discuss
+     briefly; don't need to fully resolve it for portfolio purposes, just
+     show you checked and understand what a violation implies. -->
+
+## Random Survival Forest (Flexible Alternative)
+
+<!--
+Motivation: Cox assumes a linear, additive log-hazard. RSF relaxes this,
+capturing nonlinear effects and interactions without specifying a functional
+form -- same "classical vs. flexible model" theme as the GARCH-RNN project.
+-->
+
+```{r}
+rsf_fit <- rfsrc(
+  Surv(tenure, Churn) ~ .,
+  data = df_model,
+  ntree = 500,
+  importance = TRUE
+)
+
+print(rsf_fit)
+```
+
+### Variable Importance
+
+```{r}
+plot(gg_vimp(rsf_fit))
+```
+
+## Model Comparison
+
+<!--
+Primary metric: concordance index (C-index) -- standard in survival analysis,
+NOT accuracy/AUC. Compare Cox PH vs RSF on held-out test set (or OOB for RSF).
+-->
+
+```{r}
+# Cox concordance (from model summary, or recompute on held-out test set)
+cox_c_index <- summary(cox_fit)$concordance["C"]
+
+# RSF out-of-bag concordance
+rsf_c_index <- 1 - rsf_fit$err.rate[length(rsf_fit$err.rate)]
+
+cat(sprintf("Cox PH C-index: %.4f\n", cox_c_index))
+cat(sprintf("RSF C-index: %.4f\n", rsf_c_index))
+```
+
+<!--
+Discuss honestly:
+- If RSF barely beats Cox, that's a valid finding (relationships are mostly
+  linear/additive in this dataset) -- same honest-null framing as the
+  "flat likelihood valley" conclusion in the GARCH-RNN project.
+- If RSF clearly wins, point to which nonlinear interactions it likely
+  captured that Cox couldn't (variable importance plot helps here).
+-->
+
+## Business Takeaway
+
+<!--
+Translate technical findings into action. Example structure:
+- "Customers on month-to-month contracts with X have a hazard ratio of Y --
+  prioritize this segment for retention campaigns."
+- Estimate potential impact: e.g. "reducing churn hazard in this segment by
+  20% could retain ~N customers over the next 12 months."
+- Keep this section non-technical -- this is what a hiring manager skimming
+  the project will actually read.
+-->
+
+## Conclusion
+
+<!--
+2-4 sentences summarizing:
+1. What KM/Cox revealed about retention drivers.
+2. Whether RSF added predictive value over Cox, and why.
+3. Practical implication for a retention strategy.
+-->
