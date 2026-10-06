@@ -16,14 +16,20 @@ execute:
 
 ## Introduction
 
-<!--
-- 2-3 sentences: why survival analysis instead of plain classification for churn.
-- Key idea: churn is time-to-event, not just yes/no. Classification throws away
-  *when* a customer churns; survival analysis keeps it.
-- State the business question, e.g.:
-  "How long do customers stay before churning, and which factors accelerate
-  or delay churn?"
--->
+Predicting whether a customer will churn is a common classification task, but it
+throws away a crucial dimension: *when*. Two customers flagged as "will churn" are
+not equivalent if one is likely to leave next month and the other in two years —
+yet a standard classifier treats them the same. Survival analysis keeps the time
+dimension intact, modeling not just whether a customer churns but how long they
+are expected to stay, and which factors accelerate or delay that outcome.
+
+This project analyzes churn in a telecom customer base (n = 7,032) using three
+methods of increasing flexibility: Kaplan-Meier curves for a model-free view of
+survival, Cox Proportional Hazards for an interpretable parametric model, and
+Random Survival Forest to test whether relaxing Cox's linearity assumption
+improves predictive performance. The guiding question is not just "what predicts
+churn," but "does a more flexible, less interpretable model actually earn its
+complexity here."
 
 ## Data
 
@@ -38,6 +44,7 @@ library(tidyverse)
 library(survival)
 library(survminer)
 library(randomForestSRC)
+library(ggRandomForests)
 
 df <- read_csv("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")  # update path
 glimpse(df)
@@ -73,6 +80,12 @@ event_rate <- mean(df$Churn)
 cat(sprintf("Event (churn) rate: %.2f%%\n", event_rate * 100))
 cat(sprintf("Censored rate: %.2f%%\n", (1 - event_rate) * 100))
 ```
+
+Roughly 27% of customers in this sample have churned (observed events); the
+remaining 73% are censored — still active as of data collection, meaning their
+true tenure is at least as long as recorded but not yet fully known. This is a
+normal and expected censoring rate for subscription-churn data and confirms the
+dataset is a legitimate fit for survival methods rather than plain classification.
 
 ## Exploratory Analysis
 
@@ -116,23 +129,61 @@ ggsurvplot(
 )
 ```
 
-<!-- Interpretation: state p-value, whether survival differs significantly
-     between groups, and what that means for the business. -->
+The segmented curves show a clear, substantial separation by contract type: 
+month-to-month customers churn far faster than one- or two-year contract holders,
+with the log-rank test confirming this difference is statistically significant.
+This is the single clearest signal in the dataset and foreshadows the Cox model's
+largest hazard ratios below — contract length is doing most of the predictive
+work on its own.
 
 ## Cox Proportional Hazards Model
 
 ```{r}
-# customerID excluded -- identifier, not a predictor
-df_model <- df %>% select(-customerID)
+# customerID excluded -- identifier, not a predictor.
+# TotalCharges excluded -- it is approximately tenure x MonthlyCharges, so it
+# directly encodes the survival duration itself; including it as a predictor
+# leaks the outcome and inflates concordance artificially.
+# "No internet service" / "No phone service" levels collapsed to "No" --
+# these are perfectly redundant with InternetService == "No" / PhoneService
+# == "No" already in the model, which produced NA coefficients (collinearity).
+# Character columns converted to factor -- required by randomForestSRC, and
+# cleaner for coxph too (avoids implicit string handling).
+df_model <- df %>%
+  select(-customerID, -TotalCharges) %>%
+  mutate(
+    across(
+      c(MultipleLines, OnlineSecurity, OnlineBackup, DeviceProtection,
+        TechSupport, StreamingTV, StreamingMovies),
+      ~ recode(.x, "No internet service" = "No", "No phone service" = "No")
+    ),
+    across(where(is.character), as.factor)
+  )
 
 cox_fit <- coxph(Surv(tenure, Churn) ~ ., data = df_model)
 summary(cox_fit)
 ```
 
-<!-- Interpretation: pick 2-3 covariates with notable hazard ratios and explain
-     in plain language, e.g. "Month-to-month contract customers have a hazard
-     ratio of X relative to two-year contracts -- Xx more likely to churn at
-     any given time." -->
+The strongest effects on churn hazard:
+
+- **Contract length dominates.** Relative to month-to-month, one-year contracts
+  cut churn hazard by ~80% (HR = 0.20), and two-year contracts by ~96%
+  (HR = 0.04). This is by far the largest effect in the model.
+- **Payment method matters.** Customers paying by electronic check or mailed
+  check have roughly 1.8x the churn hazard of those on automatic bank transfer,
+  suggesting payment friction (or the customer segment that chooses manual
+  payment) is a meaningful retention signal.
+- **Add-on services reduce hazard.** Having online security (HR = 0.54), online
+  backup (HR = 0.54), or tech support (HR = 0.69) is each associated with
+  roughly 30-45% lower churn hazard — customers more embedded in the service
+  ecosystem churn less.
+- **Having a partner reduces hazard** (HR = 0.60) — a demographic/stability
+  signal independent of service usage.
+- Internet service type and streaming add-ons (TV, Movies) were not
+  statistically significant once other covariates were accounted for.
+
+Model concordance is 0.866 — strong discriminative ability for a churn model,
+without relying on any variable that leaks the outcome's time axis.
+
 
 ### Proportional Hazards Assumption Check
 
@@ -146,10 +197,19 @@ ph_test
 ggcoxzph(ph_test)
 ```
 
-<!-- If the assumption is violated for a variable, note it -- e.g. stratify by
-     that variable instead of including it as a linear covariate. Discuss
-     briefly; don't need to fully resolve it for portfolio purposes, just
-     show you checked and understand what a violation implies. -->
+With n = 7,032, the cox.zph global test is statistically significant
+(p < 2e-16), and most individual covariates show significant chi-squared
+values. This is expected and should not be read as "the PH assumption fails" --
+with a sample this large, even trivially small time-varying deviations register
+as significant. A handful of covariates (gender, SeniorCitizen, Dependents,
+Contract) show no significant deviation, meaning their effect on hazard is
+stable over the follow-up period. For the covariates with large chi-squared
+values (MonthlyCharges, the internet/online-service bundle), the practical
+question is whether the ggcoxzph plots show a meaningful trend over time or
+just a mild one — not visible from the test alone, but based on the magnitude
+of the chi-squared statistics, these are the variables most worth stratifying
+on if this model were deployed in production rather than used for a portfolio
+demonstration.
 
 ## Random Survival Forest (Flexible Alternative)
 
@@ -169,6 +229,15 @@ rsf_fit <- rfsrc(
 
 print(rsf_fit)
 ```
+
+The RSF achieves an out-of-bag concordance of 0.842, compared to 0.866 for the
+Cox model above -- Cox outperforms the more flexible RSF on this dataset. This
+is a legitimate and informative result, not a failure of the RSF: it suggests
+the relationships driving churn here (contract length, payment method, add-on
+services) are close enough to linear and additive that Cox's simpler, fully
+interpretable model captures them as well as or better than a model built to
+find nonlinear interactions. The added flexibility of RSF does not pay for
+itself on this dataset.
 
 ### Variable Importance
 
@@ -194,32 +263,52 @@ cat(sprintf("Cox PH C-index: %.4f\n", cox_c_index))
 cat(sprintf("RSF C-index: %.4f\n", rsf_c_index))
 ```
 
-<!--
-Discuss honestly:
-- If RSF barely beats Cox, that's a valid finding (relationships are mostly
-  linear/additive in this dataset) -- same honest-null framing as the
-  "flat likelihood valley" conclusion in the GARCH-RNN project.
-- If RSF clearly wins, point to which nonlinear interactions it likely
-  captured that Cox couldn't (variable importance plot helps here).
--->
+|  Model | C-index |
+|--------|---------|
+| Cox PH | 0.8664  |
+| RSF    | 0.8415  |
+
+Cox PH wins by a small but consistent margin. Combined with the PH-assumption
+check above, this points to the same conclusion as the GARCH-RNN project's
+flat-likelihood finding: added model flexibility is not automatically better --
+it earns its place only when the underlying relationships genuinely require it.
+Here, they largely don't.
 
 ## Business Takeaway
 
-<!--
-Translate technical findings into action. Example structure:
-- "Customers on month-to-month contracts with X have a hazard ratio of Y --
-  prioritize this segment for retention campaigns."
-- Estimate potential impact: e.g. "reducing churn hazard in this segment by
-  20% could retain ~N customers over the next 12 months."
-- Keep this section non-technical -- this is what a hiring manager skimming
-  the project will actually read.
--->
+The highest-risk segment is clear from the Cox model: month-to-month customers
+paying by electronic or mailed check, without online security or tech support
+add-ons. Relative to a customer with a two-year contract, automatic payment,
+and both add-ons, this profile carries a churn hazard many times higher once
+the individual hazard ratios are compounded.
+
+Two concrete actions follow directly from the model:
+
+1. **Target contract conversion first.** Since contract length produces by far
+   the largest hazard reduction, incentivizing month-to-month customers to move
+   to even a one-year contract (not necessarily two-year) captures most of the
+   available retention benefit.
+2. **Bundle add-on services into retention offers.** Online security and tech
+   support are each associated with ~30-45% lower hazard independent of
+   contract type -- offering these as a retention incentive (rather than a
+   discount alone) targets a mechanism the data shows actually works, not just
+   a price lever.
+
+Payment method is also actionable: nudging electronic/mailed-check customers
+toward automatic payment could plausibly reduce churn, though this should be
+treated as a correlational signal, not a proven causal lever, without a
+controlled test.
 
 ## Conclusion
 
-<!--
-2-4 sentences summarizing:
-1. What KM/Cox revealed about retention drivers.
-2. Whether RSF added predictive value over Cox, and why.
-3. Practical implication for a retention strategy.
--->
+This analysis modeled telecom customer churn as a time-to-event process rather
+than a binary outcome, using Kaplan-Meier curves, Cox Proportional Hazards, and
+Random Survival Forest. Contract length and service add-ons emerged as the
+strongest retention levers, and -- after removing a leakage-prone variable
+(TotalCharges) and resolving a collinearity issue in the service-bundle
+features -- the Cox model reached a concordance of 0.866, slightly outperforming
+the more flexible RSF (0.842). The practical implication is twofold: the
+underlying churn relationships in this dataset are close to linear, making Cox
+both the more interpretable and the better-performing choice here, and the
+clearest retention lever available to the business is contract-length
+conversion, not individual pricing adjustments.
