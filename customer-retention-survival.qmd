@@ -27,11 +27,11 @@ p {
 
 Predicting whether a customer will churn is a common classification task, but it throws away a crucial question: *when*. Two customers flagged as "will churn" are not equivalent if one is likely to leave next month and the other in two years, yet a standard classifier treats them the same. Survival analysis keeps the time dimension intact, modeling not just whether a customer will churn, but how long they are expected to stay and which factors accelerate or delay churn.
 
-This project analyzes churn in a [telecom customer dataset](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) using three methods: Kaplan-Meier curves for a model-free view of survival, Cox Proportional Hazards for an interpretable parametric model, and Random Survival Forest to test whether relaxing Cox's linearity assumption improves predictive performance. The question is not just "what predicts churn", but "does a more flexible, less interpretable model actually earn its complexity here".
+This project analyzes churn in a [telecom customer dataset](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) using three methods: Kaplan-Meier curves for a model-free view of survival, Cox Proportional Hazards for an interpretable semi-parametric model, and Random Survival Forest to test whether relaxing Cox's linearity assumption improves predictive performance. The question is not just "what predicts churn", but "does a more flexible, less interpretable model actually earn its complexity here".
 
 ## Data
 
-The data is the IBM Telco Customer Churn sample from Kaggle: 7,043 customers of a fictional telecom company, with account details, subscribed services, demographics, tenure in months (`tenure`) and a churn flag (`Churn`). Eleven customers with tenure = 0 (new sign-ups, all still active) were excluded because they contribute no time at risk, leaving 7,032 customers. The table below gives an overview of the variables after this cleaning.
+The data is the [IBM Telco Customer Churn](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) sample from Kaggle: 7,043 customers of a fictional telecom company, with account details, subscribed services, demographics, tenure in months (`tenure`) and a churn flag (`Churn`). Eleven customers with `tenure = 0` (new sign-ups, all still active) were excluded because they contribute no time at risk, leaving 7,032 customers. The table below gives an overview of the variables after this cleaning.
 
 ```{r}
 #| echo: false
@@ -44,7 +44,7 @@ library(ggRandomForests)
 
 set.seed(69420)
 
-df <- read_csv("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")  # update path
+df <- read_csv("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")
 ```
 
 ```{r}
@@ -54,7 +54,6 @@ df <- read_csv("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")  # update path
 #   tenure = 0 (brand-new customers, never billed). These have no observed
 #   survival time, so they're dropped rather than imputed.
 # - Churn recoded to 0/1 event indicator.
-# - customerID kept for reference but excluded from modeling formulas.
 # - SeniorCitizen cast to factor (stored as 0/1 int, but categorical).
 
 df <- df %>%
@@ -77,9 +76,6 @@ kable(overview, align = "llrl")
 
 ### Censoring check
 
-<!-- Show proportion censored vs event observed -- standard in a survival
-     write-up, reviewers will look for it. -->
-
 ```{r}
 #| echo: false
 event_rate <- mean(df$Churn)
@@ -90,7 +86,7 @@ About 27% of customers are recorded as churned (events). The remaining 73% are r
 
 ### Predictor Screening
 
-Two predictors were excluded before modeling. `TotalCharges` is approximately tenure × MonthlyCharges, so it encodes the follow-up time itself, the quantity being modeled, and would leak it into the predictors. `MonthlyCharges` is almost fully determined by the customer's service bundle (R² = 0.999 when regressed on the service columns), which made the individual service effects unstable. Screening was done after an initial model fit showed unstable estimates for the service variables; the variance inflation factors below identify the cause.
+Two predictors were excluded before modeling. `TotalCharges` is approximately `tenure` × `MonthlyCharges`, so it encodes the follow-up time itself, the quantity being modeled, and would leak it into the predictors. `MonthlyCharges` is almost fully determined by the customer's service bundle ($R^2 = 0.999$ when regressed on the service columns), which made the individual service effects unstable. Screening was done after an initial model fit showed unstable estimates for the service variables; the variance inflation factors below identify the cause.
 
 ```{r}
 #| echo: false
@@ -116,12 +112,12 @@ vif_tbl <- function(d, label) {
 
 full_join(
   vif_tbl(d_with, "VIF (with MonthlyCharges)"),
-  vif_tbl(d_without, "VIF (without)"),
+  vif_tbl(d_without, "VIF (without MonthlyCharges)"),
   by = "Variable"
 ) %>% knitr::kable()
 ```
 
-With MonthlyCharges included, its VIF is about 864 and the service variables (InternetService, PhoneService, streaming) range from 24 to 35. After exclusion, all VIFs are below 2. Price sensitivity is therefore not assessed separately. A VIF above 10 was treated as problematic.
+With `MonthlyCharges` included, its VIF is about 864 and the service variables (`InternetService`, `PhoneService`, `StreamingTV`, `StreamingMovies`) range from 24 to 35. After exclusion, all VIFs are below 2. Price sensitivity is therefore not assessed separately. A VIF above 10 was treated as problematic.
 
 ```{r}
 #| echo: false
@@ -135,6 +131,7 @@ df_model <- d_without
 #| echo: false
 ggplot(df, aes(x = tenure, fill = factor(Churn))) +
   geom_histogram(alpha = 0.6, position = "identity", bins = 36) +
+  scale_x_continuous(breaks = seq(0, 72, by = 12)) +
   labs(x = "Tenure (months)", y = "Count", fill = "Churned") +
   theme_minimal()
 ```
@@ -157,9 +154,12 @@ km_fit <- survfit(Surv(tenure, Churn) ~ 1, data = df)
 
 ggsurvplot(
   km_fit,
+  break.time.by = 12,
   data = df,
+  legend.title = "Contract",
   title = "Overall Survival Curve",
   xlab = "Tenure (months)",
+  xlim = c(0, 72),
   ylab = "Survival Probability"
 )
 ```
@@ -186,6 +186,7 @@ ggsurvplot(
   legend.labs = c("Month-to-month", "One year", "Two year"),
   legend.title = "Contract",
   xlab = "Tenure (months)",
+  xlim = c(0, 72),
   font.main = c(14, "bold"),
   font.x = c(12),
   font.y = c(12),
@@ -204,7 +205,18 @@ Character columns converted to factor, required by randomForestSRC
 -->
 ```{r}
 cox_fit <- coxph(Surv(tenure, Churn) ~ ., data = df_model)
-summary(cox_fit)
+broom::tidy(cox_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  transmute(
+    Term      = term,
+    HR        = round(estimate, 2),
+    `95% CI`  = sprintf("%.2f – %.2f", conf.low, conf.high),
+    `p-value` = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  ) %>%
+  knitr::kable(align = "lrrr")
+
+cc <- summary(cox_fit)$concordance
+cat(sprintf("Concordance = %.3f (se = %.3f); n = %d, events = %d",
+            cc["C"], cc["se(C)"], cox_fit$n, cox_fit$nevent))
 ```
 
 Hazard ratios (HR) are relative to the reference level; 95% confidence intervals in brackets.
@@ -212,7 +224,7 @@ Hazard ratios (HR) are relative to the reference level; 95% confidence intervals
 - **Contract length dominates.** Relative to month-to-month, one-year contracts cut churn hazard by about 80% (HR 0.20 [0.17, 0.24]) and two-year contracts by about 96% (HR 0.04 [0.03, 0.05]). These are time-averaged effects; see the proportional hazards check below.
 - **Internet service type matters.** Fiber optic customers have about 47% higher hazard than DSL customers (HR 1.47 [1.28, 1.70]); customers with no internet service have about 67% lower hazard (HR 0.33 [0.26, 0.42]).
 - **Payment method.** Electronic check (HR 1.80 [1.56, 2.07]) and mailed check (HR 1.76 [1.48, 2.09]) customers have roughly 1.8x the hazard of those on automatic bank transfer. Credit card (automatic) does not differ significantly.
-- **Add-on services are associated with lower hazard:** online security (HR 0.52), online backup (HR 0.52), tech support (HR 0.66), device protection (HR 0.72) and multiple lines (HR 0.63).
+- **Add-on services are associated with lower hazard.** Online security (HR 0.52), online backup (HR 0.52), tech support (HR 0.66), device protection (HR 0.72) and multiple lines (HR 0.63).
 - **Partner and billing.** Having a partner is associated with lower hazard (HR 0.60 [0.54, 0.66]); paperless billing with higher hazard (HR 1.20 [1.07, 1.34]).
 - Gender, senior citizen status, dependents, phone service and streaming TV are not significant at the 5% level; streaming movies is weakly significant (HR 0.87, p = 0.014).
 
@@ -221,13 +233,24 @@ Model concordance is 0.866 (se 0.003), computed on the full sample: strong discr
 
 ### Proportional Hazards Assumption Check
 
-<!--
-This is the step most portfolio projects skip. Including it signals rigor.
--->
+```{r}
+ph_tbl <- function(z) {
+  as.data.frame(z$table) %>%
+    tibble::rownames_to_column("Term") %>%
+    transmute(
+      Term,
+      `Chi-sq`  = round(chisq, 1),
+      df        = df,
+      `p-value` = ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+    ) %>%
+    knitr::kable(align = "lrrr")
+}
+ph_test <- cox.zph(cox_fit)
+ph_tbl(ph_test)
+```
 
 ```{r}
-ph_test <- cox.zph(cox_fit)
-ph_test
+#| echo: false
 library(tidyr)
 
 # scaled Schoenfeld residuals from the cox.zph object
@@ -239,7 +262,6 @@ top_terms <- rownames(ph_test$table)[order(-ph_test$table[, "chisq"])]
 top_terms <- setdiff(top_terms, "GLOBAL")[1:4]
 
 # keep the residual columns that belong to those terms
-# (factor terms have one column per level, e.g. "ContractOne year")
 keep_cols <- colnames(ph_test$y)[
   sapply(colnames(ph_test$y), function(cn) any(startsWith(cn, top_terms)))
 ]
@@ -263,7 +285,7 @@ ggplot(resid_long, aes(x = time, y = residual)) +
         plot.title = element_text(face = "bold"))
 ```
 
-The cox.zph global test is significant (p < 2e-16), and most covariates show significant chi-squared values. With n = 7,032 this is expected, so the plots matter more than the p-values. The Schoenfeld residual plots for the four largest deviations (StreamingTV, Contract, StreamingMovies, MultipleLines) show flat or near-flat trends for the two streaming variables and only a mild drift for MultipleLines, whose protective effect weakens slightly with tenure. Contract is the one clear violation: its residual trend is flat through roughly month 30, then declines and crosses zero around month 55-60, indicating that the protective effect of longer contracts weakens at long tenures.
+The `cox.zph` global test is significant (p < 0.001), and most covariates show significant chi-squared values. With n = 7,032 this is expected, so the plots matter more than the p-values. The Schoenfeld residual plots for the four largest deviations (`StreamingTV`, `Contract`, `StreamingMovies`, `MultipleLines`) show flat or near-flat trends for the two streaming variables and only a mild drift for `MultipleLines`, whose protective effect weakens slightly with tenure. `Contract` is the one clear violation: its residual trend is flat through roughly month 30, then declines and crosses zero around month 55-60, indicating that the protective effect of longer contracts weakens at long tenures.
 
 
 ### Stratified Cox Model
@@ -273,13 +295,24 @@ cox_strat <- coxph(
   Surv(tenure, Churn) ~ . - Contract + strata(Contract),
   data = df_model
 )
-summary(cox_strat)
-
-cox.zph(cox_strat)
-cat(sprintf("Stratified Cox C-index: %.4f\n", summary(cox_strat)$concordance["C"]))
+broom::tidy(cox_strat, exponentiate = TRUE, conf.int = TRUE) %>%
+  transmute(
+    Term      = term,
+    HR        = round(estimate, 2),
+    `95% CI`  = sprintf("%.2f – %.2f", conf.low, conf.high),
+    `p-value` = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  ) %>%
+  knitr::kable(align = "lrrr")
 ```
 
-Because Contract is also the strongest predictor, the model was refit with Contract as a stratification variable, which gives each contract type its own baseline hazard. Hazard ratios for all other covariates were nearly unchanged (e.g. fiber optic 1.46 vs 1.47, electronic check 1.78 vs 1.80), so the conclusions of the main model are robust to this violation. The stratified model's concordance (0.72) is not comparable to the unstratified model's, because with strata it only counts pairs within the same contract type.
+```{r}
+ph_tbl(cox.zph(cox_strat))
+
+cc_s <- summary(cox_strat)$concordance
+cat(sprintf("Stratified Cox concordance = %.3f (se = %.3f)", cc_s["C"], cc_s["se(C)"]))
+```
+
+Because `Contract` is also the strongest predictor, the model was refit with `Contract` as a stratification variable, which gives each contract type its own baseline hazard. Hazard ratios for all other covariates were nearly unchanged (e.g. fiber optic 1.46 vs 1.47, electronic check 1.78 vs 1.80), so the conclusions of the main model are robust to this violation. The stratified model's concordance (0.72) is not comparable to the unstratified model's, because with strata it only counts pairs within the same contract type.
 
 ## Random Survival Forest (Flexible Alternative)
 
@@ -297,8 +330,23 @@ rsf_fit <- rfsrc(
   importance = TRUE,
   seed = -42
 )
+```
 
-print(rsf_fit)
+```{r}
+#| echo: false
+tibble(
+  Setting = c("Customers", "Churn events", "Trees", "Predictors",
+              "Variables tried per split", "Minimum terminal node size",
+              "OOB error (1 - C-index)"),
+  Value   = c(format(rsf_fit$n, big.mark = ","),
+              format(rsf_fit$ndead, big.mark = ","),
+              rsf_fit$ntree,
+              length(rsf_fit$xvar.names),
+              rsf_fit$mtry,
+              rsf_fit$nodesize,
+              sprintf("%.4f", rsf_fit$err.rate[length(rsf_fit$err.rate)]))
+) %>%
+  knitr::kable(align = "lr")
 ```
 
 The RSF achieves an out-of-bag concordance of 0.8419, compared to 0.8664 for the Cox model above. Cox's figure is computed on the same sample it was fitted on, while the RSF figure is out-of-bag, so the two are not strictly comparable and the gap of about 0.0245 should be read as suggestive. Still, the flexible model shows no clear advantage here, which may mean the relationships driving churn (contract length, payment method, add-on services) are close to linear and additive.
@@ -306,10 +354,11 @@ The RSF achieves an out-of-bag concordance of 0.8419, compared to 0.8664 for the
 ### Variable Importance
 
 ```{r}
+#| echo: false
 plot(gg_vimp(rsf_fit))
 ```
 
-Permutation importance ranks Contract far above everything else (about 0.42, roughly eight times the next variable). InternetService (about 0.05), PaymentMethod, OnlineSecurity, OnlineBackup, TechSupport and Partner follow; gender, paperless billing and senior citizen contribute almost nothing. This ordering agrees closely with the Cox hazard ratios, so both models identify the same drivers of churn.
+Permutation importance ranks `Contract` far above everything else (about 0.42, roughly eight times the next variable). `InternetService` (about 0.05), `PaymentMethod`, `OnlineSecurity`, `OnlineBackup`, `TechSupport` and `Partner` follow; `gender`, `PaperlessBilling` and `SeniorCitizen` contribute almost nothing. This ordering agrees closely with the Cox hazard ratios, so both models identify the same drivers of churn.
 
 ## Model Comparison
 
@@ -319,6 +368,7 @@ NOT accuracy/AUC. Compare Cox PH vs RSF on held-out test set (or OOB for RSF).
 -->
 
 ```{r}
+#| echo: false
 # Cox concordance on the full sample (in-sample)
 cox_c_index <- summary(cox_fit)$concordance["C"]
 
@@ -342,8 +392,8 @@ Two concrete actions follow directly from the model:
 1. **Target contract conversion first.** Since contract length produces by far the largest hazard reduction, incentivizing month-to-month customers to move to even a one-year contract (not necessarily two-year) captures most of the available retention benefit. Contract choice is self-selected, so this is an association, not a guaranteed effect of converting customers.
 2. **Bundle add-on services into retention offers.** Online security and tech support are associated with about 48% and 34% lower hazard respectively (HR 0.52 and 0.66), independent of contract type -- offering these as a retention incentive (rather than a discount alone) targets a pattern the data supports, not just a price lever.
 
-Payment method is also actionable: nudging electronic/mailed-check customers toward automatic payment could plausibly reduce churn, though this should be treated as a correlational signal, not a proven causal lever, without a controlled test.
+Payment method is also actionable: nudging electronic or mailed-check customers toward automatic payment could plausibly reduce churn, though this should be treated as a correlational signal, not a proven causal lever, without a controlled test.
 
 ## Conclusion
 
-This analysis modeled telecom customer churn as a time-to-event process rather than a binary outcome, using Kaplan-Meier curves, Cox Proportional Hazards, and Random Survival Forest. Contract length is by far the strongest retention signal, followed by internet service type, payment method and add-on services such as online security, online backup and tech support. After excluding TotalCharges (it encodes the follow-up time) and MonthlyCharges (almost fully determined by the service bundle), the Cox model reached a concordance of 0.8664 on the full sample, against 0.8419 out-of-bag for the Random Survival Forest. Because the two figures are computed differently, the gap is suggestive rather than conclusive, but the flexible model showed no clear advantage, so the simpler and more interpretable Cox model is the better choice here. The most actionable lever is contract conversion. The data is a snapshot of a fictional telco, so absolute churn figures should not be read as real-world rates.
+This analysis modeled telecom customer churn as a time-to-event process rather than a binary outcome, using Kaplan-Meier curves, Cox Proportional Hazards, and Random Survival Forest. Contract length is by far the strongest retention signal, followed by internet service type, payment method and add-on services such as online security, online backup and tech support. After excluding `TotalCharges` (it encodes the follow-up time) and `MonthlyCharges` (almost fully determined by the service bundle), the Cox model reached a concordance of 0.8664 on the full sample, against 0.8419 out-of-bag for the Random Survival Forest. Because the two figures are computed differently, the gap is suggestive rather than conclusive, but the flexible model showed no clear advantage, so the simpler and more interpretable Cox model is the better choice here. The most actionable lever is contract conversion. The data is a snapshot of a fictional telco, so absolute churn figures should not be read as real-world rates.
